@@ -140,7 +140,7 @@ KrkaWM::~KrkaWM() {
 
 void KrkaWM::UpdateWindowBorders(Window new_focus_client) {
     for (const auto &pair : clients_) {
-        Window client = pair.second;
+        Window client = pair.first;
         XSetWindowBorder(display_, client, // Set border on client window
                          client == new_focus_client ? BORDER_COLOR_ACTIVE
                                                     : BORDER_COLOR_INACTIVE);
