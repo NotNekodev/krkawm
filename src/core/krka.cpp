@@ -11,11 +11,11 @@ bool KrkaWM::wm_detected_ = false;
 std::unordered_map<Window, Window> KrkaWM::clients_;
 Logger KrkaWM::logger_("krka.log");
 
-#define MARGIN                10
+#define MARGIN                5
 #define BG_COLOR              0x40d190
 #define BORDER_COLOR_INACTIVE 0x000000
 #define BORDER_COLOR_ACTIVE   0xff0000
-#define BORDER_WIDTH          4
+#define BORDER_WIDTH          2
 
 std::string windowToString(Window w) {
     char name[64];
