@@ -1,5 +1,6 @@
 #include <core/krka.hpp>
 
+#include <Imlib2.h>
 #include <X11/X.h>
 #include <functional>
 #include <iostream>
@@ -16,6 +17,7 @@ Logger KrkaWM::logger_("krka.log");
 #define BORDER_COLOR_INACTIVE 0x000000
 #define BORDER_COLOR_ACTIVE   0xff0000
 #define BORDER_WIDTH          2
+#define WALLPAPER_PATH_JPG    "./wallpaper.jpg"
 
 std::string windowToString(Window w) {
     char name[64];
@@ -26,9 +28,8 @@ std::string windowToString(Window w) {
 void KrkaWM::TileClients() {
     const int screenwidth  = DisplayWidth(display_, DefaultScreen(display_));
     const int screenheight = DisplayHeight(display_, DefaultScreen(display_));
-    const int margin =
-        MARGIN; // Margin in pixels between frames and around screen
-    int count = clients_.size();
+    const int margin       = MARGIN;
+    int count              = clients_.size();
     if (count == 0)
         return;
 
@@ -112,7 +113,61 @@ KrkaWM::KrkaWM(Display *display)
     : display_(display), root_(DefaultRootWindow(display_)),
       focused_window_(None), dragging_(false), resizing_(false),
       drag_window_(None) {
-    XSetWindowBackground(display_, root_, BG_COLOR);
+    imlib_context_set_display(display_);
+    imlib_context_set_drawable(root_);
+
+    Imlib_Image wallpaper = imlib_load_image(WALLPAPER_PATH_JPG);
+    if (!wallpaper) {
+        logger_.err() << "Failed to load wallpaper image from "
+                      << WALLPAPER_PATH_JPG << std::endl;
+        XSetWindowBackground(display_, root_, BG_COLOR);
+        XClearWindow(display_, root_);
+        XFlush(display_);
+        return;
+    }
+
+    imlib_context_set_image(wallpaper);
+
+    int screen        = DefaultScreen(display_);
+    int width         = DisplayWidth(display_, screen);
+    int height        = DisplayHeight(display_, screen);
+    Visual *visual    = DefaultVisual(display_, screen);
+    Colormap colormap = DefaultColormap(display_, screen);
+
+    imlib_context_set_visual(visual);
+    imlib_context_set_colormap(colormap);
+
+    Imlib_Image scaled = imlib_create_cropped_scaled_image(
+        0, 0, imlib_image_get_width(), imlib_image_get_height(), width, height);
+
+    imlib_free_image(); // Free original wallpaper image
+
+    if (!scaled) {
+        logger_.err() << "Failed to scale wallpaper image." << std::endl;
+        XClearWindow(display_, root_);
+        XFlush(display_);
+        return;
+    }
+
+    // Set context to scaled image
+    imlib_context_set_image(scaled);
+
+    // Draw directly to the root window first
+    imlib_context_set_drawable(root_);
+    imlib_render_image_on_drawable(0, 0);
+
+    // Create a pixmap copy for background
+    Pixmap pix = XCreatePixmap(display_, root_, width, height,
+                               DefaultDepth(display_, screen));
+    imlib_context_set_drawable(pix);
+    imlib_render_image_on_drawable(0, 0);
+
+    // Set background pixmap
+    XSetWindowBackgroundPixmap(display_, root_, pix);
+    XClearWindow(display_, root_);
+    XFlush(display_);
+
+    imlib_free_image(); // Free scaled image
 }
 
 KrkaWM::~KrkaWM() {

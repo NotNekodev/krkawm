@@ -1,6 +1,6 @@
 CC = clang++
-CFLAGS = -Wall -Wextra -O2 -Iinclude/
-LDFLAGS = -lX11
+CFLAGS = -Wall -Wextra -O2 -Iinclude $(shell pkg-config --cflags imlib2)
+LDFLAGS = -lX11 $(shell pkg-config --libs imlib2) -lm
 
 SRC = src/main.cpp src/core/krka.cpp src/core/log.cpp
 OUT = krkawm
