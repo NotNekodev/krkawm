@@ -1,3 +1,4 @@
 krkawm
 compile_commands.json
 .cache/
+*.log

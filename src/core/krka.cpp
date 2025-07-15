@@ -9,18 +9,31 @@ using ::std::unique_ptr;
 
 bool KrkaWM::wm_detected_ = false;
 std::unordered_map<Window, Window> KrkaWM::clients_;
+Logger KrkaWM::logger_("krka.log");
+
+#define MARGIN                10
+#define BG_COLOR              0x40d190
+#define BORDER_COLOR_INACTIVE 0x000000
+#define BORDER_COLOR_ACTIVE   0xff0000
+#define BORDER_WIDTH          4
+
+std::string windowToString(Window w) {
+    char name[64];
+    snprintf(name, sizeof(name), "0x%lx", w);
+    return std::string(name);
+}
 
 void KrkaWM::TileClients() {
-    const int screen_width  = DisplayWidth(display_, DefaultScreen(display_));
-    const int screen_height = DisplayHeight(display_, DefaultScreen(display_));
-
-    const int border = 3;
-    int count        = clients_.size();
+    const int screenwidth  = DisplayWidth(display_, DefaultScreen(display_));
+    const int screenheight = DisplayHeight(display_, DefaultScreen(display_));
+    const int margin =
+        MARGIN; // Margin in pixels between frames and around screen
+    int count = clients_.size();
     if (count == 0)
         return;
 
     std::vector<Window> clientOrder;
-    for (const auto &[client, _] : clients_) {
+    for (const auto &[client, ph] : clients_) {
         clientOrder.push_back(client);
     }
 
@@ -29,51 +42,67 @@ void KrkaWM::TileClients() {
             if (index >= count)
                 return;
 
+            int fw = w;
+            int fh = h;
+            int fx = x;
+            int fy = y;
+
+            if (index + 1 < count) {
+                if (index % 2 == 0) {
+                    // Split horizontally - leave margin between halves
+                    fw = (w - margin) / 2;
+                    place(index + 1, x + fw + margin, y, w - fw - margin, h);
+                } else {
+                    // Split vertically - leave margin between halves
+                    fh = (h - margin) / 2;
+                    place(index + 1, x, y + fh + margin, w, h - fh - margin);
+                }
+            }
+
             Window client = clientOrder[index];
             Window frame  = clients_[client];
 
-            int fx = x, fy = y, fw = w, fh = h;
+            // Frame takes the allocated space
+            XMoveResizeWindow(display_, frame, fx - (2 * BORDER_WIDTH),
+                              fy - (2 * BORDER_WIDTH), fw + (2 * BORDER_WIDTH),
+                              fh + (2 * BORDER_WIDTH));
 
-            int client_w = std::max(50, fw - 2 * border);
-            int client_h = std::max(50, fh - 2 * border);
-
-            XMoveResizeWindow(display_, frame, fx, fy, fw, fh);
+            // Client window needs to leave space for border
+            int client_w = std::max(50, fw - 2 * BORDER_WIDTH);
+            int client_h = std::max(50, fh - 2 * BORDER_WIDTH);
 
             XWindowChanges changes;
-            changes.x      = border;
-            changes.y      = border;
+            changes.x      = 2 * BORDER_WIDTH; // Offset by border width
+            changes.y      = 2 * BORDER_WIDTH; // Offset by border width
             changes.width  = client_w;
             changes.height = client_h;
+
             XConfigureWindow(display_, client, CWX | CWY | CWWidth | CWHeight,
                              &changes);
-
             XMapWindow(display_, client);
             XMapWindow(display_, frame);
             XRaiseWindow(display_, frame);
 
-            if (index + 1 < count) {
-                if (index % 2 == 0) {
-                    place(index + 1, x + w / 2, y, w / 2, h);
-                    fw = w / 2;
-                } else {
-                    place(index + 1, x, y + h / 2, w, h / 2);
-                    fh = h / 2;
-                }
-            }
-
-            std::cout << "Tiled window " << index << ": client=" << client
-                      << ", frame=" << frame << ", x=" << fx << ", y=" << fy
-                      << ", w=" << fw << ", h=" << fh << std::endl;
+            logger_.debug()
+                << "Tiled window " << index
+                << ": client=" << windowToString(client)
+                << ", frame=" << windowToString(frame) << ", x=" << fx
+                << ", y=" << fy << ", w=" << fw << ", h=" << fh << std::endl;
         };
 
-    place(0, 0, 0, screen_width, screen_height);
+    // Start tiling with margin around screen edges
+    place(0, margin, margin, screenwidth - 2 * margin,
+          screenheight - 2 * margin);
+
+    XClearWindow(display_, root_);
     XFlush(display_);
 }
 
 unique_ptr<KrkaWM> KrkaWM::Create() {
     Display *display = XOpenDisplay(nullptr);
     if (!display) {
-        std::cerr << "Failed to open X display!" << std::endl;
+        logger_.fatal() << "Failed to open X display " << XDisplayName(nullptr)
+                        << std::endl;
         return nullptr;
     }
     return unique_ptr<KrkaWM>(new KrkaWM(display));
@@ -83,27 +112,38 @@ KrkaWM::KrkaWM(Display *display)
     : display_(display), root_(DefaultRootWindow(display_)),
       focused_window_(None), dragging_(false), resizing_(false),
       drag_window_(None) {
+    XSetWindowBackground(display_, root_, BG_COLOR);
 }
 
 KrkaWM::~KrkaWM() {
-    for (const auto &pair : clients_) {
-        Unframe(pair.first);
+
+    Window parent, *children;
+    unsigned int nchildren;
+
+    if (!XQueryTree(display_, root_, &parent, &parent, &children, &nchildren)) {
+        for (auto &pair : clients_) {
+            Unframe(pair.first);
+            XDestroyWindow(display_, pair.second); // Destroy all frames
+        }
     }
-    XCloseDisplay(display_);
+
+    for (unsigned int i = 0; i < nchildren; i++) {
+        Window client_window = children[i];
+        if (clients_.count(client_window)) {
+            Unframe(client_window);
+            XDestroyWindow(display_, clients_[client_window]); // Destroy frame
+        } else {
+            XDestroyWindow(display_, client_window);
+        }
+    }
 }
 
 void KrkaWM::UpdateWindowBorders(Window new_focus_client) {
-    const unsigned long ACTIVE_BORDER_COLOR   = 0xff0000;
-    const unsigned long INACTIVE_BORDER_COLOR = 0x000000;
-
-    if (focused_window_ != None && clients_.count(focused_window_)) {
-        Window old_frame = clients_[focused_window_];
-        XSetWindowBorder(display_, old_frame, INACTIVE_BORDER_COLOR);
-    }
-
-    if (new_focus_client != None && clients_.count(new_focus_client)) {
-        Window new_frame = clients_[new_focus_client];
-        XSetWindowBorder(display_, new_frame, ACTIVE_BORDER_COLOR);
+    for (const auto &pair : clients_) {
+        Window client = pair.second;
+        XSetWindowBorder(display_, client, // Set border on client window
+                         client == new_focus_client ? BORDER_COLOR_ACTIVE
+                                                    : BORDER_COLOR_INACTIVE);
     }
 }
 
@@ -168,7 +208,9 @@ void KrkaWM::Run() {
     XQueryTree(display_, root_, &returned_root, &returned_parent,
                &top_level_windows, &num_top_level_windows);
     if (root_ != returned_root) {
-        std::cerr << "Failed to query root window!" << std::endl;
+        logger_.fatal() << "Root window changed during query tree: "
+                        << windowToString(root_)
+                        << " != " << windowToString(returned_root) << std::endl;
         XUngrabServer(display_);
         return;
     }
@@ -182,7 +224,7 @@ void KrkaWM::Run() {
     if (fork() == 0) {
         setsid();
         execlp("xterm", "xterm", nullptr);
-        std::cerr << "Failed to launch xterm" << std::endl;
+        logger_.warn() << "Failed to launch xterm" << std::endl;
         _exit(1);
     }
 
@@ -238,6 +280,7 @@ void KrkaWM::Run() {
 }
 
 int KrkaWM::OnWMDetected(Display *display, XErrorEvent *event) {
+    (void)display;
     if (event->error_code == BadAccess) {
         wm_detected_ = true;
     }
@@ -247,14 +290,14 @@ int KrkaWM::OnWMDetected(Display *display, XErrorEvent *event) {
 int KrkaWM::OnXError(Display *display, XErrorEvent *event) {
     char error_text[256];
     XGetErrorText(display, event->error_code, error_text, sizeof(error_text));
-    std::cerr << "X Error: code=" << event->error_code
-              << ", resourceid=" << event->resourceid
-              << ", message=" << error_text << std::endl;
+    logger_.warn() << "X Error: code=" << event->error_code
+                   << ", resourceid=" << event->resourceid
+                   << ", message=" << error_text << std::endl;
     return 0;
 }
 
 void KrkaWM::OnCreateNotify(const XCreateWindowEvent &e) {
-    std::cout << "Created new Window: " << e.window << std::endl;
+    logger_.info() << "Created new Window: " << e.window << std::endl;
 }
 
 void KrkaWM::OnConfigureRequest(const XConfigureRequestEvent &e) {
@@ -268,18 +311,18 @@ void KrkaWM::OnConfigureRequest(const XConfigureRequestEvent &e) {
     changes.stack_mode   = e.detail;
 
     if (clients_.count(e.window)) {
-        // For already framed windows, apply tiling instead of requested size
         Window frame = clients_[e.window];
-        TileClients(); // Re-tile to enforce dwindle layout
-        std::cout << "ConfigureRequest for framed window: " << e.window
-                  << ", frame=" << frame << ", tiling applied" << std::endl;
+        TileClients();
+        logger_.info() << "ConfigureRequest for framed window: "
+                       << windowToString(e.window)
+                       << ", frame=" << windowToString(frame)
+                       << ", tiling applied" << std::endl;
     } else {
-        // For new windows, apply the requested size temporarily, then frame and
-        // tile
         XConfigureWindow(display_, e.window, e.value_mask, &changes);
-        std::cout << "ConfigureRequest for new window: " << e.window
-                  << ", x=" << e.x << ", y=" << e.y << ", width=" << e.width
-                  << ", height=" << e.height << std::endl;
+        logger_.info() << "ConfigureRequest for new window: "
+                       << windowToString(e.window) << ", x=" << e.x
+                       << ", y=" << e.y << ", width=" << e.width
+                       << ", height=" << e.height << std::endl;
     }
 }
 
@@ -287,21 +330,18 @@ void KrkaWM::OnMapRequest(const XMapRequestEvent &e) {
     if (!clients_.count(e.window)) {
         Frame(e.window, false);
     }
-    // Map the window and ensure tiling is applied
+
     XMapWindow(display_, e.window);
     TileClients(); // Re-tile to ensure new window is placed correctly
-    std::cout << "MapRequest for window: " << e.window << ", tiled"
-              << std::endl;
+    logger_.info() << "MapRequest for window: " << windowToString(e.window)
+                   << ", tiled" << std::endl;
 }
 
 void KrkaWM::Frame(Window w, bool was_created_before_window_manager) {
-    const unsigned int BORDER_WIDTH  = 3;
-    const unsigned long BORDER_COLOR = 0x000000;
-    const unsigned long BG_COLOR     = 0x0000ff;
-
     XWindowAttributes x_window_attrs;
     if (!XGetWindowAttributes(display_, w, &x_window_attrs)) {
-        std::cerr << "Failed to get attributes for window " << w << std::endl;
+        logger_.err() << "Failed to get attributes for window "
+                      << windowToString(w) << std::endl;
         return;
     }
 
@@ -312,12 +352,11 @@ void KrkaWM::Frame(Window w, bool was_created_before_window_manager) {
         }
     }
 
-    // Create frame with reasonable initial size (not full screen)
     const int initial_width  = std::min(x_window_attrs.width, 800);
     const int initial_height = std::min(x_window_attrs.height, 600);
-    const Window frame       = XCreateSimpleWindow(
-        display_, root_, x_window_attrs.x, x_window_attrs.y, initial_width,
-        initial_height, BORDER_WIDTH, BORDER_COLOR, BG_COLOR);
+    const Window frame =
+        XCreateSimpleWindow(display_, root_, x_window_attrs.x, x_window_attrs.y,
+                            initial_width, initial_height, 0, 0, BG_COLOR);
 
     XSelectInput(display_, frame,
                  SubstructureRedirectMask | SubstructureNotifyMask |
@@ -338,49 +377,53 @@ void KrkaWM::Frame(Window w, bool was_created_before_window_manager) {
                     PropModeReplace, (unsigned char *)name, strlen(name));
 
     clients_[w] = frame;
-    TileClients(); // Immediately tile to apply dwindle layout
-    std::cout << "Framed Window: " << w << " with frame " << frame << std::endl;
+    TileClients();
+    logger_.info() << "Framed Window: " << windowToString(w) << " with frame "
+                   << windowToString(frame) << std::endl;
 
-    if (focused_window_ == None) {
-        XSetInputFocus(display_, w, RevertToPointerRoot, CurrentTime);
-        focused_window_ = w;
-        UpdateWindowBorders(w);
-    }
+    XSetWindowBorderWidth(display_, w, BORDER_WIDTH);
+    XSetWindowBorder(display_, w, BORDER_COLOR_INACTIVE);
+
+    XSetInputFocus(display_, w, RevertToPointerRoot, CurrentTime);
+    focused_window_ = w;
+    UpdateWindowBorders(w);
 }
 
-// Rest of the code remains unchanged
 void KrkaWM::OnReparentNotify(const XReparentEvent &e) {
-    std::cout << "ReparentNotify: window=" << e.window
-              << ", parent=" << e.parent << std::endl;
+    logger_.debug() << "ReparentNotify: window=" << windowToString(e.window)
+                    << ", parent=" << windowToString(e.parent) << std::endl;
 }
 
 void KrkaWM::OnMapNotify(const XMapEvent &e) {
     if (clients_.count(e.window)) {
-        std::cout << "MapNotify for client window: " << e.window << std::endl;
+        logger_.debug() << "MapNotify for client window: "
+                        << windowToString(e.window) << std::endl;
         Window frame = clients_[e.window];
         XMapWindow(display_, frame);
-        TileClients(); // Ensure tiling is applied after mapping
+        TileClients();
     }
 }
 
 void KrkaWM::OnConfigureNotify(const XConfigureEvent &e) {
     if (clients_.count(e.window)) {
-        std::cout << "ConfigureNotify for client window: " << e.window
-                  << ", x=" << e.x << ", y=" << e.y << ", width=" << e.width
-                  << ", height=" << e.height << std::endl;
+        logger_.debug() << "ConfigureNotify for client window: " << e.window
+                        << ", x=" << e.x << ", y=" << e.y
+                        << ", width=" << e.width << ", height=" << e.height
+                        << std::endl;
     }
 }
 
 void KrkaWM::OnUnmapNotify(const XUnmapEvent &e) {
     if (!clients_.count(e.window)) {
-        std::cout << "Ignore UnmapNotify for non-client window " << e.window
-                  << std::endl;
+        logger_.warn() << "Ignore UnmapNotify for non-client window "
+                       << e.window << std::endl;
         return;
     }
 
     if (e.event == root_) {
-        std::cout << "Ignore UnmapNotify for reparented pre-existing window "
-                  << e.window << std::endl;
+        logger_.warn()
+            << "Ignore UnmapNotify for reparented pre-existing window "
+            << e.window << std::endl;
         return;
     }
 
@@ -398,7 +441,7 @@ void KrkaWM::Unframe(Window w) {
     XRemoveFromSaveSet(display_, w);
     XDestroyWindow(display_, frame);
     clients_.erase(w);
-    std::cout << "Unframed Window: " << w << std::endl;
+    logger_.info() << "Unframed Window: " << windowToString(w) << std::endl;
 
     if (focused_window_ == w) {
         focused_window_ = None;
@@ -408,11 +451,13 @@ void KrkaWM::Unframe(Window w) {
                            CurrentTime);
             focused_window_ = next_client;
             UpdateWindowBorders(next_client);
-            std::cout << "Focused next client: " << next_client << std::endl;
+            logger_.info() << "Focused next client: " << next_client
+                           << std::endl;
         } else {
             XSetInputFocus(display_, root_, RevertToPointerRoot, CurrentTime);
             UpdateWindowBorders(None);
-            std::cout << "No clients left, focused root window" << std::endl;
+            logger_.info() << "No clients left, focused root window"
+                           << std::endl;
         }
     }
     TileClients();
@@ -427,8 +472,9 @@ void KrkaWM::OnDestroyNotify(const XDestroyWindowEvent &e) {
     } else {
         for (auto it = clients_.begin(); it != clients_.end(); ++it) {
             if (it->second == client_window) {
-                std::cout << "DestroyNotify for frame window: " << client_window
-                          << ", unframing client: " << it->first << std::endl;
+                logger_.info()
+                    << "DestroyNotify for frame window: " << client_window
+                    << ", unframing client: " << it->first << std::endl;
                 Unframe(it->first);
                 break;
             }
@@ -545,12 +591,12 @@ void KrkaWM::OnClientMessage(const XClientMessageEvent &e) {
         e.data.l[0] == ATOM_WM_DELETE_WINDOW) {
         Window client_window = e.window;
         if (clients_.count(client_window)) {
-            std::cout << "Received WM_DELETE_WINDOW for window: "
-                      << client_window << std::endl;
+            logger_.info() << "Received WM_DELETE_WINDOW for window: "
+                           << client_window << std::endl;
             Unframe(client_window);
         } else {
-            std::cout << "Ignoring WM_DELETE_WINDOW for unmanaged window: "
-                      << client_window << std::endl;
+            logger_.warn() << "Ignoring WM_DELETE_WINDOW for unmanaged window: "
+                           << client_window << std::endl;
         }
     }
 }
@@ -569,8 +615,8 @@ void KrkaWM::OnKeyPress(const XKeyEvent &e) {
         }
 
         if (!clients_.count(client_window)) {
-            std::cout << "Ignoring close request for unmanaged window: "
-                      << client_window << std::endl;
+            logger_.warn() << "Ignoring close request for unmanaged window: "
+                           << client_window << std::endl;
             return;
         }
 
@@ -601,11 +647,8 @@ void KrkaWM::OnKeyPress(const XKeyEvent &e) {
             msg.xclient.data.l[1]    = CurrentTime;
             XSendEvent(display_, client_window, False, NoEventMask, &msg);
             XFlush(display_);
-            std::cout << "Sent WM_DELETE_WINDOW to window: " << client_window
-                      << std::endl;
         } else {
-            // Forcefully destroy the window
-            std::cout
+            logger_.err()
                 << "Window " << client_window
                 << " does not support WM_DELETE_WINDOW, forcefully destroying"
                 << std::endl;
@@ -637,7 +680,6 @@ void KrkaWM::OnKeyPress(const XKeyEvent &e) {
                            CurrentTime);
             focused_window_ = next_client;
             UpdateWindowBorders(next_client);
-            std::cout << "Cycled to window: " << next_client << std::endl;
         }
     } else if (e.state & MASTER_KEY &&
                e.keycode == XKeysymToKeycode(display_, WM_TERMINATE_KEY)) {
@@ -648,7 +690,7 @@ void KrkaWM::OnKeyPress(const XKeyEvent &e) {
         if (fork() == 0) {
             setsid();
             execlp("xterm", "xterm", nullptr);
-            std::cerr << "Failed to launch xterm" << std::endl;
+            logger_.err() << "Failed to launch xterm" << std::endl;
             _exit(1);
         }
     }

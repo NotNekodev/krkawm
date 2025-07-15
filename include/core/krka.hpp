@@ -7,6 +7,7 @@ extern "C" {
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 }
+#include <core/log.hpp>
 #include <memory>
 #include <string.h>
 #include <util/checks.hpp>
@@ -22,6 +23,8 @@ public:
     static ::std::unique_ptr<KrkaWM> Create();
     ~KrkaWM();
     void Run();
+
+    static Logger logger_;
 
 private:
     KrkaWM(Display *display);
