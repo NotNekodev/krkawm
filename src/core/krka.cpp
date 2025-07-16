@@ -50,11 +50,9 @@ void KrkaWM::TileClients() {
 
             if (index + 1 < count) {
                 if (index % 2 == 0) {
-                    // Split horizontally - leave margin between halves
                     fw = (w - margin) / 2;
                     place(index + 1, x + fw + margin, y, w - fw - margin, h);
                 } else {
-                    // Split vertically - leave margin between halves
                     fh = (h - margin) / 2;
                     place(index + 1, x, y + fh + margin, w, h - fh - margin);
                 }
@@ -63,18 +61,16 @@ void KrkaWM::TileClients() {
             Window client = clientOrder[index];
             Window frame  = clients_[client];
 
-            // Frame takes the allocated space
             XMoveResizeWindow(display_, frame, fx - (2 * BORDER_WIDTH),
                               fy - (2 * BORDER_WIDTH), fw + (2 * BORDER_WIDTH),
                               fh + (2 * BORDER_WIDTH));
 
-            // Client window needs to leave space for border
             int client_w = std::max(50, fw - 2 * BORDER_WIDTH);
             int client_h = std::max(50, fh - 2 * BORDER_WIDTH);
 
             XWindowChanges changes;
-            changes.x      = 2 * BORDER_WIDTH; // Offset by border width
-            changes.y      = 2 * BORDER_WIDTH; // Offset by border width
+            changes.x      = 2 * BORDER_WIDTH;
+            changes.y      = 2 * BORDER_WIDTH;
             changes.width  = client_w;
             changes.height = client_h;
 
@@ -91,7 +87,6 @@ void KrkaWM::TileClients() {
                 << ", y=" << fy << ", w=" << fw << ", h=" << fh << std::endl;
         };
 
-    // Start tiling with margin around screen edges
     place(0, margin, margin, screenwidth - 2 * margin,
           screenheight - 2 * margin);
 
@@ -140,7 +135,7 @@ KrkaWM::KrkaWM(Display *display)
     Imlib_Image scaled = imlib_create_cropped_scaled_image(
         0, 0, imlib_image_get_width(), imlib_image_get_height(), width, height);
 
-    imlib_free_image(); // Free original wallpaper image
+    imlib_free_image();
 
     if (!scaled) {
         logger_.err() << "Failed to scale wallpaper image." << std::endl;
@@ -149,25 +144,21 @@ KrkaWM::KrkaWM(Display *display)
         return;
     }
 
-    // Set context to scaled image
     imlib_context_set_image(scaled);
 
-    // Draw directly to the root window first
     imlib_context_set_drawable(root_);
     imlib_render_image_on_drawable(0, 0);
 
-    // Create a pixmap copy for background
     Pixmap pix = XCreatePixmap(display_, root_, width, height,
                                DefaultDepth(display_, screen));
     imlib_context_set_drawable(pix);
     imlib_render_image_on_drawable(0, 0);
 
-    // Set background pixmap
     XSetWindowBackgroundPixmap(display_, root_, pix);
     XClearWindow(display_, root_);
     XFlush(display_);
 
-    imlib_free_image(); // Free scaled image
+    imlib_free_image();
 }
 
 KrkaWM::~KrkaWM() {
@@ -178,7 +169,7 @@ KrkaWM::~KrkaWM() {
     if (!XQueryTree(display_, root_, &parent, &parent, &children, &nchildren)) {
         for (auto &pair : clients_) {
             Unframe(pair.first);
-            XDestroyWindow(display_, pair.second); // Destroy all frames
+            XDestroyWindow(display_, pair.second);
         }
     }
 
@@ -186,7 +177,7 @@ KrkaWM::~KrkaWM() {
         Window client_window = children[i];
         if (clients_.count(client_window)) {
             Unframe(client_window);
-            XDestroyWindow(display_, clients_[client_window]); // Destroy frame
+            XDestroyWindow(display_, clients_[client_window]);
         } else {
             XDestroyWindow(display_, client_window);
         }
@@ -196,7 +187,7 @@ KrkaWM::~KrkaWM() {
 void KrkaWM::UpdateWindowBorders(Window new_focus_client) {
     for (const auto &pair : clients_) {
         Window client = pair.first;
-        XSetWindowBorder(display_, client, // Set border on client window
+        XSetWindowBorder(display_, client,
                          client == new_focus_client ? BORDER_COLOR_ACTIVE
                                                     : BORDER_COLOR_INACTIVE);
     }
@@ -387,7 +378,7 @@ void KrkaWM::OnMapRequest(const XMapRequestEvent &e) {
     }
 
     XMapWindow(display_, e.window);
-    TileClients(); // Re-tile to ensure new window is placed correctly
+    TileClients();
     logger_.info() << "MapRequest for window: " << windowToString(e.window)
                    << ", tiled" << std::endl;
 }
@@ -409,9 +400,13 @@ void KrkaWM::Frame(Window w, bool was_created_before_window_manager) {
 
     const int initial_width  = std::min(x_window_attrs.width, 800);
     const int initial_height = std::min(x_window_attrs.height, 600);
+
     const Window frame =
-        XCreateSimpleWindow(display_, root_, x_window_attrs.x, x_window_attrs.y,
-                            initial_width, initial_height, 0, 0, BG_COLOR);
+        XCreateWindow(display_, root_, x_window_attrs.x, x_window_attrs.y,
+                      initial_width, initial_height, 0, CopyFromParent,
+                      InputOutput, CopyFromParent, 0, nullptr);
+
+    XSetWindowBackgroundPixmap(display_, frame, ParentRelative);
 
     XSelectInput(display_, frame,
                  SubstructureRedirectMask | SubstructureNotifyMask |
@@ -440,7 +435,6 @@ void KrkaWM::Frame(Window w, bool was_created_before_window_manager) {
     XSetWindowBorder(display_, w, BORDER_COLOR_INACTIVE);
 
     XSetInputFocus(display_, w, RevertToPointerRoot, CurrentTime);
-    focused_window_ = w;
     UpdateWindowBorders(w);
 }
 
@@ -661,7 +655,6 @@ void KrkaWM::OnKeyPress(const XKeyEvent &e) {
         e.keycode == XKeysymToKeycode(display_, WINDOW_CLOSE_KEY)) {
         Window client_window = e.window;
 
-        // Ensure the window is a client window (not a frame)
         for (const auto &pair : clients_) {
             if (pair.second == e.window) {
                 client_window = pair.first;
@@ -675,7 +668,6 @@ void KrkaWM::OnKeyPress(const XKeyEvent &e) {
             return;
         }
 
-        // Check if the window supports WM_DELETE_WINDOW
         Atom *protocols;
         int num_protocols;
         Bool supports_delete = False;
@@ -691,7 +683,6 @@ void KrkaWM::OnKeyPress(const XKeyEvent &e) {
         }
 
         if (supports_delete) {
-            // Send WM_DELETE_WINDOW message
             XEvent msg;
             memset(&msg, 0, sizeof(msg));
             msg.xclient.type         = ClientMessage;
