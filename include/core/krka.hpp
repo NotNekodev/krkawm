@@ -45,8 +45,6 @@ private:
     Atom ATOM_WM_PROTOCOLS;
     Atom ATOM_WM_DELETE_WINDOW;
 
-    void TileClients();
-
     void OnCreateNotify(const XCreateWindowEvent &e);
     void OnConfigureRequest(const XConfigureRequestEvent &e);
     void OnMapRequest(const XMapRequestEvent &e);
