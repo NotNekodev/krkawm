@@ -1,21 +1,18 @@
 #include <core/krka.hpp>
 
+extern "C" {
 #include <Imlib2.h>
 #include <X11/X.h>
-#include <iostream>
+#include <string.h>
 #include <unistd.h>
+}
+#include <iostream>
 
 using ::std::unique_ptr;
 
 bool KrkaWM::wm_detected_ = false;
 std::unordered_map<Window, Window> KrkaWM::clients_;
 Logger KrkaWM::logger_("krka.log");
-
-#define BG_COLOR              0x40d190
-#define BORDER_COLOR_INACTIVE 0x000000
-#define BORDER_COLOR_ACTIVE   0xff0000
-#define BORDER_WIDTH          2
-#define WALLPAPER_PATH_JPG    "./wallpaper.jpg"
 
 std::string windowToString(Window w) {
     char name[64];
@@ -37,57 +34,59 @@ KrkaWM::KrkaWM(Display *display)
     : display_(display), root_(DefaultRootWindow(display_)),
       focused_window_(None), dragging_(false), resizing_(false),
       drag_window_(None) {
-    imlib_context_set_display(display_);
-    imlib_context_set_drawable(root_);
+    if (!InitializeDisplay()) {
+        logger_.fatal() << "Failed to initialize display" << std::endl;
+    }
+}
 
-    Imlib_Image wallpaper = imlib_load_image(WALLPAPER_PATH_JPG);
-    if (!wallpaper) {
-        logger_.err() << "Failed to load wallpaper image from "
-                      << WALLPAPER_PATH_JPG << std::endl;
-        XSetWindowBackground(display_, root_, BG_COLOR);
-        XClearWindow(display_, root_);
-        XFlush(display_);
-        return;
+bool KrkaWM::InitializeDisplay() {
+    display_manager_ = DisplayManager::Create(this, display_);
+    if (!display_manager_) {
+        logger_.fatal() << "Failed to create display manager" << std::endl;
+        return false;
     }
 
-    imlib_context_set_image(wallpaper);
+    int randr_event_base, randr_error_base;
+    int randr_major, randr_minor;
 
-    int screen        = DefaultScreen(display_);
-    int width         = DisplayWidth(display_, screen);
-    int height        = DisplayHeight(display_, screen);
-    Visual *visual    = DefaultVisual(display_, screen);
-    Colormap colormap = DefaultColormap(display_, screen);
-
-    imlib_context_set_visual(visual);
-    imlib_context_set_colormap(colormap);
-
-    Imlib_Image scaled = imlib_create_cropped_scaled_image(
-        0, 0, imlib_image_get_width(), imlib_image_get_height(), width, height);
-
-    imlib_free_image();
-
-    if (!scaled) {
-        logger_.err() << "Failed to scale wallpaper image." << std::endl;
-        XClearWindow(display_, root_);
-        XFlush(display_);
-        return;
+    if (!XRRQueryExtension(display_, &randr_event_base, &randr_error_base)) {
+        logger_.warn() << "Xrandr extension not available" << std::endl;
+        return false;
     }
 
-    imlib_context_set_image(scaled);
+    if (!XRRQueryVersion(display_, &randr_major, &randr_minor)) {
+        logger_.warn() << "Failed to query Xrandr version" << std::endl;
+        return false;
+    }
 
-    imlib_context_set_drawable(root_);
-    imlib_render_image_on_drawable(0, 0);
+    logger_.info() << "Xrandr version: " << randr_major << "." << randr_minor
+                   << std::endl;
 
-    Pixmap pix = XCreatePixmap(display_, root_, width, height,
-                               DefaultDepth(display_, screen));
-    imlib_context_set_drawable(pix);
-    imlib_render_image_on_drawable(0, 0);
+    XRRSelectInput(display_, root_,
+                   RRScreenChangeNotifyMask | RRCrtcChangeNotifyMask |
+                       RROutputChangeNotifyMask);
 
-    XSetWindowBackgroundPixmap(display_, root_, pix);
-    XClearWindow(display_, root_);
-    XFlush(display_);
+    randr_event_base_ = randr_event_base;
 
-    imlib_free_image();
+    display_manager_->RegisterConfigChangeCallback(
+        [this](const DisplayConfiguration &config) {
+            OnDisplayConfigurationChange(config);
+        });
+
+    display_manager_->SetWallpaper(WALLPAPER_PATH_JPG);
+
+    return true;
+}
+void KrkaWM::OnDisplayConfigurationChange(const DisplayConfiguration &config) {
+    (void)config;
+    logger_.info() << "Display configuration changed, updating window positions"
+                   << std::endl;
+
+    for (const auto &client_pair : clients_) {
+        EnsureWindowVisible(client_pair.second);
+    }
+
+    UpdateWindowBorders(focused_window_);
 }
 
 KrkaWM::~KrkaWM() {
@@ -124,6 +123,130 @@ KrkaWM::~KrkaWM() {
     }
     XUngrabServer(display_);
     XFlush(display_);
+}
+
+void KrkaWM::HandleCrossMonitorDrag(Window window, int new_x, int new_y) {
+    if (!display_manager_) {
+        XMoveWindow(display_, window, new_x, new_y);
+        return;
+    }
+
+    Window root_return;
+    int x, y;
+    unsigned int width, height, border, depth;
+    if (!XGetGeometry(display_, window, &root_return, &x, &y, &width, &height,
+                      &border, &depth)) {
+        logger_.warn()
+            << "Failed to get geometry for window in HandleCrossMonitorDrag: "
+            << windowToString(window) << std::endl;
+        return;
+    }
+
+    const DisplayConfiguration &config = display_manager_->GetConfiguration();
+    int virtual_x = 0, virtual_y = 0;
+    int virtual_width = 0, virtual_height = 0;
+
+    for (const auto &monitor : config.monitors) {
+        virtual_x      = std::min(virtual_x, monitor.x);
+        virtual_y      = std::min(virtual_y, monitor.y);
+        virtual_width  = std::max(virtual_width, monitor.x + monitor.width);
+        virtual_height = std::max(virtual_height, monitor.y + monitor.height);
+    }
+
+    new_x = std::max(virtual_x - static_cast<int>(width) + 50,
+                     std::min(new_x, virtual_width - 50));
+    new_y = std::max(virtual_y - static_cast<int>(height) + 50,
+                     std::min(new_y, virtual_height - 50));
+
+    logger_.debug() << "Cross-monitor drag: window " << windowToString(window)
+                    << " to position " << new_x << "," << new_y << std::endl;
+
+    XMoveWindow(display_, window, new_x, new_y);
+}
+
+void KrkaWM::SmartPositionWindow(Window frame, int preferred_x, int preferred_y,
+                                 int width, int height) {
+    if (!display_manager_) {
+        XMoveWindow(display_, frame, preferred_x, preferred_y);
+        return;
+    }
+
+    if (preferred_x == 0 && preferred_y == 0) {
+        MonitorInfo primary = display_manager_->GetPrimaryMonitor();
+        preferred_x         = primary.x + (primary.width - width) / 2;
+        preferred_y         = primary.y + (primary.height - height) / 2;
+    }
+
+    const DisplayConfiguration &config = display_manager_->GetConfiguration();
+    int virtual_x = 0, virtual_y = 0;
+    int virtual_width = 0, virtual_height = 0;
+
+    for (const auto &monitor : config.monitors) {
+        virtual_x      = std::min(virtual_x, monitor.x);
+        virtual_y      = std::min(virtual_y, monitor.y);
+        virtual_width  = std::max(virtual_width, monitor.x + monitor.width);
+        virtual_height = std::max(virtual_height, monitor.y + monitor.height);
+    }
+
+    if (preferred_x + width < virtual_x || preferred_x > virtual_width ||
+        preferred_y + height < virtual_y || preferred_y > virtual_height) {
+        MonitorInfo primary = display_manager_->GetPrimaryMonitor();
+        preferred_x         = primary.x + 50;
+        preferred_y         = primary.y + 50;
+    }
+
+    logger_.debug() << "Smart positioning window " << windowToString(frame)
+                    << " at " << preferred_x << "," << preferred_y
+                    << " (spanning allowed)" << std::endl;
+
+    XMoveWindow(display_, frame, preferred_x, preferred_y);
+}
+
+void KrkaWM::EnsureWindowVisible(Window frame) {
+    if (!display_manager_) {
+        return;
+    }
+
+    Window root_return;
+    int x, y;
+    unsigned int width, height, border, depth;
+    if (!XGetGeometry(display_, frame, &root_return, &x, &y, &width, &height,
+                      &border, &depth)) {
+        logger_.warn()
+            << "Failed to get geometry for window in EnsureWindowVisible: "
+            << windowToString(frame) << std::endl;
+        return;
+    }
+
+    const DisplayConfiguration &config = display_manager_->GetConfiguration();
+
+    int virtual_x = 0, virtual_y = 0;
+    int virtual_width = 0, virtual_height = 0;
+
+    for (const auto &monitor : config.monitors) {
+        virtual_x      = std::min(virtual_x, monitor.x);
+        virtual_y      = std::min(virtual_y, monitor.y);
+        virtual_width  = std::max(virtual_width, monitor.x + monitor.width);
+        virtual_height = std::max(virtual_height, monitor.y + monitor.height);
+    }
+
+    bool completely_outside = (x + static_cast<int>(width) < virtual_x) ||
+                              (y + static_cast<int>(height) < virtual_y) ||
+                              (x > virtual_width) || (y > virtual_height);
+
+    if (completely_outside) {
+        logger_.info() << "Window " << windowToString(frame)
+                       << " is completely outside virtual screen, repositioning"
+                       << std::endl;
+
+        MonitorInfo primary = display_manager_->GetPrimaryMonitor();
+        int new_x           = primary.x + 50;
+        int new_y           = primary.y + 50;
+
+        XMoveWindow(display_, frame, new_x, new_y);
+        logger_.info() << "Moved window to " << new_x << "," << new_y
+                       << " on monitor " << primary.name << std::endl;
+    }
 }
 
 void KrkaWM::UpdateWindowBorders(Window new_focus_client) {
@@ -194,17 +317,17 @@ void KrkaWM::GrabGlobalInput() {
 
     XSelectInput(display_, root_,
                  SubstructureRedirectMask | SubstructureNotifyMask |
-                     KeyPressMask | ButtonPressMask | ButtonReleaseMask |
-                     PointerMotionMask | FocusChangeMask);
+                     KeyPressMask | FocusChangeMask);
 }
 
 void KrkaWM::GrabWindowInput(Window frame) {
+
     XGrabButton(display_, Button1, MASTER_KEY, frame, False,
-                ButtonPressMask | ButtonReleaseMask | ButtonMotionMask,
-                GrabModeAsync, GrabModeAsync, None, None);
+                ButtonPressMask | ButtonReleaseMask, GrabModeAsync,
+                GrabModeAsync, None, None);
     XGrabButton(display_, Button3, MASTER_KEY, frame, False,
-                ButtonPressMask | ButtonReleaseMask | ButtonMotionMask,
-                GrabModeAsync, GrabModeAsync, None, None);
+                ButtonPressMask | ButtonReleaseMask, GrabModeAsync,
+                GrabModeAsync, None, None);
     XGrabKey(display_, XKeysymToKeycode(display_, WINDOW_CLOSE_KEY), MASTER_KEY,
              frame, False, GrabModeAsync, GrabModeAsync);
     XGrabKey(display_, XKeysymToKeycode(display_, WINDOW_CYCLE_KEY), MASTER_KEY,
@@ -214,6 +337,14 @@ void KrkaWM::GrabWindowInput(Window frame) {
 void KrkaWM::Run() {
     wm_detected_ = false;
     XSetErrorHandler(&KrkaWM::OnWMDetected);
+
+    if (display_manager_ && display_manager_->IsRandrAvailable()) {
+        XSelectInput(display_, root_,
+                     SubstructureRedirectMask | SubstructureNotifyMask |
+                         KeyPressMask | ButtonPressMask | ButtonReleaseMask |
+                         PointerMotionMask | FocusChangeMask);
+    }
+
     XSelectInput(display_, root_,
                  SubstructureRedirectMask | SubstructureNotifyMask |
                      KeyPressMask | ButtonPressMask | ButtonReleaseMask |
@@ -276,6 +407,13 @@ void KrkaWM::Run() {
         XEvent e;
         XNextEvent(display_, &e);
 
+        if (e.type == randr_event_base_ + RRScreenChangeNotify) {
+            XRRScreenChangeNotifyEvent *rr_event =
+                (XRRScreenChangeNotifyEvent *)&e;
+            OnRandrNotify(*rr_event);
+            continue;
+        }
+
         switch (e.type) {
         case CreateNotify:
             OnCreateNotify(e.xcreatewindow);
@@ -320,6 +458,12 @@ void KrkaWM::Run() {
             OnKeyPress(e.xkey);
             break;
         }
+    }
+}
+
+void KrkaWM::OnRandrNotify(const XRRScreenChangeNotifyEvent &e) {
+    if (display_manager_) {
+        display_manager_->HandleRandrEvent(e);
     }
 }
 
@@ -386,8 +530,19 @@ void KrkaWM::Frame(Window w, bool was_created_before_window_manager) {
         }
     }
 
-    const int initial_width  = std::min(x_window_attrs.width, 800);
-    const int initial_height = std::min(x_window_attrs.height, 600);
+    float scale_factor = 1.0f;
+    if (display_manager_) {
+        MonitorInfo target_monitor =
+            display_manager_->GetMonitorAt(x_window_attrs.x, x_window_attrs.y);
+        scale_factor = target_monitor.scale_factor;
+    }
+
+    const int initial_width =
+        std::min(static_cast<int>(x_window_attrs.width * scale_factor),
+                 static_cast<int>(800 * scale_factor));
+    const int initial_height =
+        std::min(static_cast<int>(x_window_attrs.height * scale_factor),
+                 static_cast<int>(600 * scale_factor));
 
     XGrabServer(display_);
 
@@ -395,6 +550,7 @@ void KrkaWM::Frame(Window w, bool was_created_before_window_manager) {
         display_, root_, x_window_attrs.x, x_window_attrs.y,
         initial_width + 0 * BORDER_WIDTH, initial_height + 0 * BORDER_WIDTH,
         BORDER_WIDTH, CopyFromParent, InputOutput, CopyFromParent, 0, nullptr);
+
     if (frame == None) {
         logger_.err() << "Failed to create frame window for client: "
                       << windowToString(w) << std::endl;
@@ -415,8 +571,11 @@ void KrkaWM::Frame(Window w, bool was_created_before_window_manager) {
     XAddToSaveSet(display_, w);
 
     XResizeWindow(display_, w, initial_width, initial_height);
-
     XReparentWindow(display_, w, frame, 0, 0);
+
+    SmartPositionWindow(frame, x_window_attrs.x, x_window_attrs.y,
+                        initial_width, initial_height);
+
     XMapWindow(display_, frame);
 
     Atom net_wm_name = XInternAtom(display_, "_NET_WM_NAME", False);
@@ -650,14 +809,23 @@ void KrkaWM::OnMotionNotify(const XMotionEvent &e) {
     if (dragging_) {
         int new_x = static_cast<int>(frame_start_pos_.x + dx);
         int new_y = static_cast<int>(frame_start_pos_.y + dy);
-        XMoveWindow(display_, drag_window_, new_x, new_y);
+
+        HandleCrossMonitorDrag(drag_window_, new_x, new_y);
     } else if (resizing_ && client_window != None) {
         int new_width = std::max(1, static_cast<int>(frame_start_size_.x + dx));
         int new_height =
             std::max(1, static_cast<int>(frame_start_size_.y + dy));
 
-        int client_w = std::max(50, new_width - 0 * BORDER_WIDTH);
-        int client_h = std::max(50, new_height - 0 * BORDER_WIDTH);
+        MonitorInfo current_monitor = display_manager_->GetMonitorContaining(
+            static_cast<int>(frame_start_pos_.x),
+            static_cast<int>(frame_start_pos_.y), new_width, new_height);
+
+        int min_width  = static_cast<int>(50 * current_monitor.scale_factor);
+        int min_height = static_cast<int>(50 * current_monitor.scale_factor);
+
+        int client_w = std::max(min_width, new_width - 0 * BORDER_WIDTH);
+        int client_h = std::max(min_height, new_height - 0 * BORDER_WIDTH);
+
         XResizeWindow(display_, client_window, client_w, client_h);
         XResizeWindow(display_, drag_window_, new_width, new_height);
     }
